@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+/app/build/
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+/local.properties
+.externalNativeBuild/
+.cxx/
+/captures/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs (APKs come from CI artifacts, not the repo)
+*.apk
+*.aab

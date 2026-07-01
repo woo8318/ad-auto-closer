@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">광고 자동 닫기</string>
+
+    <string name="accessibility_service_label">광고 자동 닫기</string>
+    <string name="accessibility_service_description">전면광고가 끝난 뒤 나타나는 닫기(X) 버튼을 자동으로 눌러 광고 창을 닫아줍니다. 화면 내용을 읽고 닫기 버튼만 대신 클릭합니다.</string>
+
+    <string name="main_description">전면광고가 끝나면 닫기(X) 버튼을 자동으로 눌러줍니다.\n\n동작하려면 아래 버튼을 눌러 접근성 설정에서 \'광고 자동 닫기\' 서비스를 켜주세요.</string>
+
+    <string name="status_enabled">상태: 활성화됨 ✅</string>
+    <string name="status_disabled">상태: 비활성화됨 — 접근성 설정에서 켜주세요</string>
+
+    <string name="open_accessibility_settings">접근성 설정 열기</string>
+
+    <string name="current_version">현재 버전: %1$s</string>
+    <string name="check_update">업데이트 확인</string>
+    <string name="update_none">최신 버전입니다.</string>
+    <string name="update_available_title">새 버전 %1$s 있음</string>
+    <string name="update_available_body">새 버전이 있습니다. 지금 다운로드해서 설치할까요?</string>
+    <string name="update_now">업데이트</string>
+    <string name="update_later">나중에</string>
+</resources>
