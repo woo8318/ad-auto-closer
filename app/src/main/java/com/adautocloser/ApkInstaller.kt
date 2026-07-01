@@ -1,72 +1,106 @@
 package com.adautocloser
 
 import android.app.DownloadManager
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.widget.Toast
 
 /**
  * Downloads an APK with [DownloadManager] and launches the system package
  * installer once the download completes.
  *
- * Uses DownloadManager's own content URI for the installer intent, so no
- * FileProvider is required. The user is prompted to allow installs the first time
- * (REQUEST_INSTALL_PACKAGES).
+ * Robustness (v0.2.3): instead of relying on the ACTION_DOWNLOAD_COMPLETE broadcast
+ * (which can be missed, and left the UI stuck on "다운로드 중"), we POLL the download
+ * status. On success we launch the installer; on failure or timeout we fall back to
+ * opening the APK URL in the browser, which always works on Samsung/One UI.
+ *
+ * The file is saved to the app-specific external dir, so no storage permission is
+ * needed and [DownloadManager.getUriForDownloadedFile] yields an installable
+ * content:// URI.
  */
 object ApkInstaller {
 
+    private const val TAG = "ApkInstaller"
     private const val APK_MIME = "application/vnd.android.package-archive"
+    private const val POLL_INTERVAL_MS = 700L
+    private const val TIMEOUT_MS = 90_000L
+
+    private val handler = Handler(Looper.getMainLooper())
 
     fun downloadAndInstall(context: Context, url: String, fileName: String) {
-        val appContext = context.applicationContext
-        val dm = appContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val app = context.applicationContext
+        val dm = app.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
 
         val request = DownloadManager.Request(Uri.parse(url)).apply {
             setTitle(fileName)
             setMimeType(APK_MIME)
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            setDestinationInExternalFilesDir(app, Environment.DIRECTORY_DOWNLOADS, fileName)
         }
 
-        val downloadId = dm.enqueue(request)
-        Toast.makeText(appContext, "업데이트 다운로드 중…", Toast.LENGTH_SHORT).show()
+        val downloadId = try {
+            dm.enqueue(request)
+        } catch (e: Exception) {
+            Log.w(TAG, "enqueue failed; opening browser", e)
+            openInBrowser(app, url)
+            return
+        }
 
-        registerCompletionReceiver(appContext, dm, downloadId)
+        toast(app, "업데이트 다운로드 중…")
+        pollUntilDone(app, dm, downloadId, url, System.currentTimeMillis())
     }
 
-    private fun registerCompletionReceiver(
-        appContext: Context,
+    private fun pollUntilDone(
+        app: Context,
         dm: DownloadManager,
-        downloadId: Long
+        downloadId: Long,
+        url: String,
+        startedAt: Long
     ) {
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context, intent: Intent) {
-                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
-                if (id != downloadId) return
-                appContext.unregisterReceiver(this)
-
-                val uri = dm.getUriForDownloadedFile(downloadId)
-                if (uri == null) {
-                    Toast.makeText(appContext, "다운로드 실패", Toast.LENGTH_SHORT).show()
-                    return
+        handler.postDelayed({
+            val status = queryStatus(dm, downloadId)
+            when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> {
+                    val uri = dm.getUriForDownloadedFile(downloadId)
+                    if (uri != null) {
+                        launchInstaller(app, uri)
+                    } else {
+                        Log.w(TAG, "download OK but uri null; opening browser")
+                        openInBrowser(app, url)
+                    }
                 }
-                launchInstaller(appContext, uri)
+                DownloadManager.STATUS_FAILED -> {
+                    Log.w(TAG, "download failed; opening browser")
+                    toast(app, "다운로드 실패 — 브라우저로 엽니다")
+                    openInBrowser(app, url)
+                }
+                else -> {
+                    // PENDING / RUNNING / PAUSED — keep waiting, or fall back on timeout.
+                    if (System.currentTimeMillis() - startedAt > TIMEOUT_MS) {
+                        Log.w(TAG, "download timed out; opening browser")
+                        toast(app, "다운로드 지연 — 브라우저로 엽니다")
+                        openInBrowser(app, url)
+                    } else {
+                        pollUntilDone(app, dm, downloadId, url, startedAt)
+                    }
+                }
+            }
+        }, POLL_INTERVAL_MS)
+    }
+
+    private fun queryStatus(dm: DownloadManager, downloadId: Long): Int {
+        dm.query(DownloadManager.Query().setFilterById(downloadId)).use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                if (idx >= 0) return cursor.getInt(idx)
             }
         }
-
-        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-        // ACTION_DOWNLOAD_COMPLETE is a system broadcast → must be exported on Android 13+.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            appContext.registerReceiver(receiver, filter)
-        }
+        return -1
     }
 
     private fun launchInstaller(context: Context, apkUri: Uri) {
@@ -75,6 +109,28 @@ object ApkInstaller {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "installer launch failed", e)
+            toast(context, "설치 화면을 열 수 없습니다")
+        }
+    }
+
+    /** Reliable fallback: let the browser download the APK, then the user taps it to install. */
+    private fun openInBrowser(context: Context, url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "browser open failed", e)
+            toast(context, "업데이트 링크를 열 수 없습니다")
+        }
+    }
+
+    private fun toast(context: Context, msg: String) {
+        handler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
     }
 }
