@@ -24,17 +24,18 @@ import android.widget.Toast
  *      2. POSITION-BASED (fallback): when the ad is drawn on a game canvas
  *         (Unity/GL) the X is NOT an accessibility node, so no text ever matches.
  *         Here we dispatch a tap at the top-right corner where close buttons almost
- *         always sit. This is gated hard for safety (see below).
+ *         always sit.
  *
- * Safety for the position fallback (avoid misfiring on the host app / clicking
- * through the ad):
- *  - Only fires while we believe an AD ACTIVITY is in the foreground — detected by
- *    matching the window's className against known ad-SDK activities
- *    ([AD_ACTIVITY_HINTS]). A normal game/app screen never matches, so we never
- *    blind-tap the app's own UI.
- *  - Waits [AD_SETTLE_MS] after the ad appears so we tap the (X) — not the ad body
- *    during its countdown, which would register a fraudulent click-through.
- *  - Heavily debounced ([GESTURE_DEBOUNCE_MS]).
+ * SAFETY (v0.2.1) — the service must never fight the user for control of the phone:
+ *  - It ignores ALL system surfaces: our own app, the launcher/home screen,
+ *    system UI (status bar / recents), and Settings ([shouldIgnorePackage]). This
+ *    prevents auto-clicking "닫기/dismiss/×" on the recents cards or blind-tapping a
+ *    home-screen icon (which is what re-launched this app before).
+ *  - The corner-tap fallback only fires while the SAME app that showed the ad is
+ *    still in the foreground, is capped at [MAX_GESTURE_ATTEMPTS] taps per ad, and
+ *    waits [AD_SETTLE_MS] so it hits the (X), not the ad body during its countdown.
+ *  - Only concrete ad-SDK activity classes count as "an ad" ([AD_ACTIVITY_HINTS]);
+ *    no broad/generic name matching.
  */
 class AdCloserService : AccessibilityService() {
 
@@ -46,10 +47,14 @@ class AdCloserService : AccessibilityService() {
     // --- Position-fallback state ---
     /** True while we believe an ad activity is in the foreground. */
     private var adActive = false
+    /** Package that showed the current ad; the fallback only acts while it stays foreground. */
+    private var adPackage: String? = null
     /** When the current ad activity first appeared (for the settle delay). */
     private var adAppearedAt = 0L
     /** Last time we dispatched a corner tap. */
     private var lastGestureAt = 0L
+    /** Corner taps dispatched for the current ad (capped so we never tap forever). */
+    private var gestureAttempts = 0
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -59,9 +64,18 @@ class AdCloserService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        val pkg = event.packageName?.toString()
+
+        // Never act on our own app, the home screen, system UI, or Settings.
+        // Leaving the ad's app also means the ad is gone.
+        if (shouldIgnorePackage(pkg)) {
+            if (adActive && pkg != adPackage) clearAdState()
+            return
+        }
+
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                updateAdState(event.className?.toString())
+                updateAdState(pkg, event.className?.toString())
                 rootInActiveWindow?.let { scanAndClose(it) }
             }
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
@@ -79,13 +93,14 @@ class AdCloserService : AccessibilityService() {
      * carries a meaningful className, so we flip state here and let content-changed
      * events reuse it.
      */
-    private fun updateAdState(className: String?) {
-        val isAd = looksLikeAdActivity(className)
-        if (isAd) {
+    private fun updateAdState(pkg: String?, className: String?) {
+        if (looksLikeAdActivity(className)) {
             if (!adActive) {
                 adActive = true
+                adPackage = pkg
                 adAppearedAt = System.currentTimeMillis()
-                Log.i(TAG, "Ad activity detected: $className")
+                gestureAttempts = 0
+                Log.i(TAG, "Ad activity detected: pkg=$pkg class=$className")
                 if (DEBUG_TOASTS) toast("광고 감지됨 — 닫기 대기")
                 // Canvas ads may emit no further content events, so poll ourselves.
                 handler.removeCallbacks(fallbackRunnable)
@@ -93,11 +108,15 @@ class AdCloserService : AccessibilityService() {
             }
         } else {
             // Foreground moved to a non-ad screen → the ad is gone.
-            if (adActive) {
-                adActive = false
-                handler.removeCallbacks(fallbackRunnable)
-            }
+            if (adActive) clearAdState()
         }
+    }
+
+    private fun clearAdState() {
+        adActive = false
+        adPackage = null
+        gestureAttempts = 0
+        handler.removeCallbacks(fallbackRunnable)
     }
 
     private fun scanAndClose(root: AccessibilityNodeInfo) {
@@ -107,36 +126,49 @@ class AdCloserService : AccessibilityService() {
         val target = findCloseButton(root) ?: return
         if (target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
             lastClickAt = now
-            adActive = false
-            handler.removeCallbacks(fallbackRunnable)
+            clearAdState()
             Log.i(TAG, "Close button clicked (node-based)")
             if (DEBUG_TOASTS) toast("닫기 버튼 클릭")
         }
     }
 
     /**
-     * Position-based fallback loop. Runs only while [adActive]; re-tries the
-     * node-based match first (the X may have just become a node), then dispatches a
-     * top-right corner tap. Reschedules itself until the ad is gone.
+     * Position-based fallback loop. Runs only while [adActive] AND the ad's own app
+     * is still foreground. Re-tries the node-based match first, then dispatches a
+     * top-right corner tap, up to [MAX_GESTURE_ATTEMPTS] times, then gives up.
      */
     private val fallbackRunnable = object : Runnable {
         override fun run() {
             if (!POSITION_FALLBACK_ENABLED || !adActive) return
             val now = System.currentTimeMillis()
 
+            val root = rootInActiveWindow
+            val curPkg = root?.packageName?.toString()
+            // Bail out the moment we're no longer on the ad's app (home, another app…).
+            if (root == null || curPkg != adPackage || shouldIgnorePackage(curPkg)) {
+                clearAdState()
+                return
+            }
+
             if (now - adAppearedAt >= AD_SETTLE_MS) {
                 // Prefer a real close node if one appeared in the meantime.
-                val node = rootInActiveWindow?.let { findCloseButton(it) }
+                val node = findCloseButton(root)
                 if (node != null && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                     lastClickAt = now
-                    adActive = false
                     Log.i(TAG, "Close button clicked (node-based, from poll)")
                     if (DEBUG_TOASTS) toast("닫기 버튼 클릭")
+                    clearAdState()
+                    return
+                }
+                if (gestureAttempts >= MAX_GESTURE_ATTEMPTS) {
+                    Log.i(TAG, "Corner-tap attempts exhausted; giving up on this ad")
+                    clearAdState()
                     return
                 }
                 if (now - lastGestureAt >= GESTURE_DEBOUNCE_MS) {
                     tapTopRight()
                     lastGestureAt = now
+                    gestureAttempts++
                 }
             }
             handler.postDelayed(this, FALLBACK_POLL_MS)
@@ -154,7 +186,7 @@ class AdCloserService : AccessibilityService() {
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
 
         val dispatched = dispatchGesture(gesture, null, null)
-        Log.i(TAG, "Corner tap dispatched=$dispatched at ($x, $y)")
+        Log.i(TAG, "Corner tap #$gestureAttempts dispatched=$dispatched at ($x, $y)")
         if (DEBUG_TOASTS) toast("우상단 탭 (캔버스 광고)")
     }
 
@@ -212,6 +244,16 @@ class AdCloserService : AccessibilityService() {
         return AD_ACTIVITY_HINTS.any { className.contains(it, ignoreCase = true) }
     }
 
+    /** Surfaces we must never touch: our own app, launcher/home, system UI, Settings. */
+    private fun shouldIgnorePackage(pkg: String?): Boolean {
+        if (pkg.isNullOrBlank()) return true
+        if (pkg == packageName) return true
+        if (pkg in IGNORED_PACKAGES) return true
+        // Any launcher (One UI: com.sec.android.app.launcher, Pixel: ...nexuslauncher, etc.)
+        if (pkg.contains("launcher", ignoreCase = true)) return true
+        return false
+    }
+
     private fun toast(msg: String) {
         handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
     }
@@ -235,6 +277,8 @@ class AdCloserService : AccessibilityService() {
         private const val GESTURE_DEBOUNCE_MS = 2500L
         /** How often the fallback loop re-checks while an ad is up. */
         private const val FALLBACK_POLL_MS = 1500L
+        /** Hard cap on corner taps per ad, so we never tap the app forever. */
+        private const val MAX_GESTURE_ATTEMPTS = 3
         /** Tap point insets from the top-right corner, in dp. */
         private const val CORNER_INSET_X_DP = 30f
         private const val CORNER_INSET_Y_DP = 52f
@@ -249,12 +293,22 @@ class AdCloserService : AccessibilityService() {
             "close", "skip", "dismiss", "skip ad", "close ad"
         )
 
+        /** Packages the service must never act on (system surfaces). */
+        private val IGNORED_PACKAGES = setOf(
+            "com.android.systemui",       // status bar, recents, nav bar
+            "com.android.settings",       // Settings (incl. the Accessibility page)
+            "com.samsung.android.settings",
+            "com.google.android.apps.nexuslauncher",
+            "com.android.launcher",
+            "android"                     // system dialogs
+        )
+
         /**
          * Foreground activity class fragments that indicate an ad is showing.
-         * Matching is substring + case-insensitive. Covers the mediation networks
-         * listed in docs/01-concept.md §3. Unity's AdUnitActivity is included so we
-         * still detect canvas ads that run inside a game's own process (e.g. BabyBus
-         * / 아기팬더의세상).
+         * Matching is substring + case-insensitive. Concrete ad-SDK activity classes
+         * only — no generic names — so normal app screens never trip the corner-tap
+         * fallback. Unity's AdUnitActivity is included so we still detect canvas ads
+         * that run inside a game's own process (e.g. BabyBus / 아기팬더의세상).
          */
         private val AD_ACTIVITY_HINTS = listOf(
             // Google AdMob / Google Mobile Ads
@@ -267,20 +321,16 @@ class AdCloserService : AccessibilityService() {
             "com.applovin.impl.adview.activity.AppLovinFullscreenActivity",
             // ironSource / LevelPlay
             "com.ironsource.sdk.controller.ControllerActivity",
-            "com.ironsource.mediationsdk.testSuite",
             // Vungle / Liftoff
             "com.vungle.warren.ui.VungleActivity",
             "com.vungle.ads.internal.ui.VungleActivity",
             // Meta Audience Network
             "com.facebook.ads.AudienceNetworkActivity",
             // Mintegral
-            "com.mbridge.msdk.activity",
+            "com.mbridge.msdk.activity.MBCommonActivity",
             // Pangle (TikTok / ByteDance)
-            "com.bytedance.sdk.openadsdk.activity",
-            // Generic hints seen across smaller SDKs
-            "InterstitialActivity",
-            "FullScreenActivity",
-            "RewardedActivity"
+            "com.bytedance.sdk.openadsdk.activity.TTFullScreenVideoActivity",
+            "com.bytedance.sdk.openadsdk.activity.TTInterstitialActivity"
         )
     }
 }
